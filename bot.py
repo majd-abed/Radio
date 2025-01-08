@@ -6,13 +6,24 @@ import json
 import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import logging
+
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class GeniusClient:
     def __init__(self, access_token: str):
         self.session = requests.Session()
         self.session.headers = {
             'Authorization': f'Bearer {access_token}',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
         }
 
     def search_song(self, query: str):
@@ -24,56 +35,46 @@ class GeniusClient:
             response.raise_for_status()
             return response.json()['response']['hits'][0]['result']
         except Exception as e:
-            print(f"Error searching: {e}")
+            logger.error(f"Error searching: {e}")
             return None
 
-    def get_lyrics(self, url: str):
+    def get_lyrics(self, url: str) -> Optional[str]:
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Cache-Control': 'max-age=0'
-            }
-            
-            response = requests.get(url, headers=headers)
+            response = self.session.get(url)
             response.raise_for_status()
+            
+            logger.debug(f"Fetching lyrics from URL: {url}")
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Try JSON-LD first
-            json_data = soup.find('script', type='application/ld+json')
-            if json_data:
-                data = json.loads(json_data.string)
-                if 'lyrics' in data:
-                    return data['lyrics'].strip()
+            # Find all divs that contain actual lyrics sections [Verse], [Chorus] etc.
+            lyrics_sections = soup.find_all('div', attrs={'data-lyrics-container': 'true'})
             
-            # Fallback to HTML parsing
-            lyrics_divs = soup.find_all('div', attrs={'data-lyrics-container': 'true'})
-            if lyrics_divs:
+            if lyrics_sections:
                 lyrics = []
-                for div in lyrics_divs:
-                    for script in div(['script', 'style']):
-                        script.decompose()
-                    text = div.get_text(separator='\n').strip()
-                    if text:
-                        lyrics.append(text)
-                return '\n'.join(lyrics)
-            
+                for section in lyrics_sections:
+                    # Get text while preserving line breaks
+                    section_text = '\n'.join(line.strip() for line in section.stripped_strings)
+                    if section_text:  # Only add non-empty sections
+                        lyrics.append(section_text)
+                
+                return '\n'.join(lyrics).strip()
+                
             return None
-            
+                    
         except Exception as e:
-            print(f"Error extracting lyrics: {e}")
+            logger.error(f"Error extracting lyrics: {e}", exc_info=True)
             return None
 
-# Initialize Genius client
-genius_client = GeniusClient("V3LW6Fa99KPiIBUyN_Oa5m8w-IPLbLHEetZw4XUX7KW6f0v-YsJJHoDAJ3J22Ztf")
+class LyricsBot:
+    def __init__(self, telegram_token: str, genius_token: str):
+        self.telegram_token = telegram_token
+        self.genius_client = GeniusClient(genius_token)
+        self.application = None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /start is issued."""
-    welcome_message = """
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send a message when the command /start is issued."""
+        welcome_message = """
 Welcome to Radio X Lyrics fetcher! 🎵
 
 Just send me the name of any song, and I'll fetch the lyrics for you!
@@ -81,77 +82,96 @@ Just send me the name of any song, and I'll fetch the lyrics for you!
 Example:
 Toxic Britney Spears
 """
-    await update.message.reply_text(welcome_message)
+        await update.message.reply_text(welcome_message)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /help is issued."""
-    help_text = """
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send a message when the command /help is issued."""
+        help_text = """
 Just send me the name of any song, and I'll fetch the lyrics for you!
 
 Example:
 Toxic Britney Spears
 """
-    await update.message.reply_text(help_text)
+        await update.message.reply_text(help_text)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming messages and fetch lyrics."""
-    query = update.message.text
-    
-    # Ignore commands
-    if query.startswith('/'):
-        return
-
-    # Search for the song
-    song = genius_client.search_song(query)
-    if not song:
-        await update.message.reply_text("❌ Sorry, couldn't find that song.")
-        return
-
-    # Send song info
-    await update.message.reply_text(
-        f"✨ Found: {song['title']} by {song['primary_artist']['name']}\n"
-        f"🔍 Fetching lyrics..."
-    )
-
-    # Get and send lyrics
-    lyrics = genius_client.get_lyrics(song['url'])
-    if lyrics:
-        # Format the header
-        header = f"[ {song['title']} - {song['primary_artist']['name']} ]\n"
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming messages and fetch lyrics."""
+        query = update.message.text
         
-        # Combine header and lyrics
-        formatted_lyrics = header + lyrics
-        
-        # Split long lyrics into multiple messages if needed
-        max_length = 4096  # Telegram's message length limit
-        lyrics_parts = [formatted_lyrics[i:i + max_length] for i in range(0, len(formatted_lyrics), max_length)]
-        
-        for part in lyrics_parts:
-            await update.message.reply_text(part)
-    else:
-        await update.message.reply_text(
-            "❌ Sorry, couldn't fetch the lyrics.\n"
-            f"You can find them here: {song['url']}"
-        )
+        # Ignore commands
+        if query.startswith('/'):
+            return
+
+        try:
+            # Search for the song
+            song = self.genius_client.search_song(query)
+            if not song:
+                await update.message.reply_text("❌ Sorry, couldn't find that song.")
+                return
+
+            # Send song info with modified format
+            await update.message.reply_text(
+                f"✨ Found: {song['title']} by {song['primary_artist']['name']}\n"
+                f"🔍 Fetching lyrics..."
+            )
+
+            # Get and send lyrics
+            lyrics = self.genius_client.get_lyrics(song['url'])
+            if lyrics:
+                # Format the header with new style
+                header = f"[ {song['title']} - {song['primary_artist']['name']} ]\n\n"
+                
+                # Combine header and lyrics
+                formatted_lyrics = header + lyrics
+                
+                # Split long lyrics into multiple messages if needed
+                max_length = 4096  # Telegram's message length limit
+                lyrics_parts = [formatted_lyrics[i:i + max_length] 
+                              for i in range(0, len(formatted_lyrics), max_length)]
+                
+                for part in lyrics_parts:
+                    await update.message.reply_text(part)
+            else:
+                await update.message.reply_text(
+                    "❌ Sorry, couldn't fetch the lyrics.\n"
+                    f"You can find them here: {song['url']}"
+                )
+        except Exception as e:
+            logger.error(f"Error handling message: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Sorry, something went wrong while processing your request."
+            )
+
+    def run(self):
+        """Start the bot."""
+        try:
+            # Create application and add handlers
+            self.application = Application.builder().token(self.telegram_token).build()
+
+            # Add command handlers
+            self.application.add_handler(CommandHandler("start", self.start))
+            self.application.add_handler(CommandHandler("help", self.help_command))
+            
+            # Add message handler for direct song queries
+            self.application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
+            )
+
+            # Start the bot
+            logger.info("Bot is starting...")
+            self.application.run_polling()
+            
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}", exc_info=True)
 
 def main():
-    """Start the bot."""
-    # Replace with your bot token from BotFather
+    # Your tokens
     TELEGRAM_TOKEN = "7657838266:AAG8Vf6OOXBTehoE5-mWJL8kmaxyN5L33iA"
+    GENIUS_TOKEN = "V3LW6Fa99KPiIBUyN_Oa5m8w-IPLbLHEetZw4XUX7KW6f0v-YsJJHoDAJ3J22Ztf"
     
-    # Create application and add handlers
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # Add message handler for direct song queries
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Start the bot
-    print("Bot is starting...")
-    application.run_polling()
+    # Create and run the bot
+    bot = LyricsBot(TELEGRAM_TOKEN, GENIUS_TOKEN)
+    bot.run()
 
 if __name__ == '__main__':
     main()
